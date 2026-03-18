@@ -113,3 +113,32 @@ if mode == "管理者設定画面":
                             st.caption(f"✨ {s['catch']}")
                             i_col1, i_col2 = st.columns(2)
                             i_col1.write(f"💰 予算: {s['budget']['name']}")
+                            i_col1.write(f"📍 アクセス: {s['mobile_access']}")
+                            i_col2.write(f"👥 最大: {s['capacity']}名")
+                            i_col2.write(f"🚬 禁煙喫煙: {s['non_smoking']}")
+                            st.write(f"🔗 [お店の詳細(ホットペッパー)]({s['urls']['pc']})")
+                            
+                            if st.button(f"この会場に決定", key=f"sel_{s['id']}"):
+                                st.session_state.final_msg = f"【親睦を深める懇親会のお知らせ】\n\n皆様お疲れ様です。検討の結果、以下の内容で決定いたしました！\n\n■日時：{selected_date}\n■場所：{s['name']}\n■住所：{s['address']}\n■地図：{s['urls']['pc']}\n■予算：{s['budget']['name']}\n\nぜひ奮ってご参加ください！"
+                                st.success(f"「{s['name']}」で決定しました！下に案内文が表示されます。")
+                
+            if "final_msg" in st.session_state:
+                st.divider()
+                st.subheader("📢 送信用案内文")
+                st.text_area("コピーして共有（Slack/Teams等）", value=st.session_state.final_msg, height=250)
+
+else:
+    st.title("🤝 懇親会 日程アンケート")
+    saved_dates, _ = load_data()
+    if not saved_dates:
+        st.info("ただいま幹事が日程を調整中です。公開までもう少々お待ちください。")
+    else:
+        st.write("皆様のご都合の良い日時にチェックをお願いします。")
+        with st.form("user_form"):
+            name = st.text_input("お名前（フルネーム）")
+            ans = {d: st.radio(d, ["○ (参加)", "△ (検討中)", "× (不参加)"], horizontal=True) for d in saved_dates}
+            if st.form_submit_button("回答を送信"):
+                if name:
+                    save_response(name, ans)
+                    st.success("回答を送信しました。ご協力ありがとうございます！")
+                else: st.error("お名前を入力してください。")
