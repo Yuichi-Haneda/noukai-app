@@ -8,8 +8,6 @@ from datetime import datetime
 
 # --- 基本設定 ---
 st.set_page_config(page_title="懇親会調整くん", page_icon="🤝", layout="wide")
-
-# Secretsの取得チェック
 API_KEY = st.secrets.get("HOTPEPPER_API_KEY", "")
 ADMIN_USER = "admin"
 ADMIN_PASS = "noukai2026"
@@ -54,81 +52,93 @@ if mode == "管理者画面":
         st.stop()
 
     saved_dates, resp_table = load_data()
-    t1, t2 = st.tabs(["日程設定", "会場選び"])
+    t1, t2 = st.tabs(["🗓 日程設定・回答確認", "🍺 会場選び・案内作成"])
 
     with t1:
-        st.subheader("候補日設定")
-        c1, c2 = st.columns(2)
-        d = c1.date_input("日付")
-        t = c2.time_input("時間")
-        if st.button("追加"):
+        st.subheader("1. 候補日時の追加")
+        col1, col2 = st.columns(2)
+        d = col1.date_input("日付")
+        t = col2.time_input("時間", value=datetime.strptime("18:30", "%H:%M").time())
+        if st.button("この日時をリストに追加"):
             dt_str = f"{d.strftime('%m/%d')}({['月','火','水','木','金','土','日'][d.weekday()]}) {t.strftime('%H:%M')}～"
+            new_list = saved_dates + [dt_str] if dt_str not in saved_dates else saved_dates
             with sqlite3.connect(DB_FILE) as conn:
                 conn.cursor().execute("DELETE FROM events")
-                conn.cursor().execute("INSERT INTO events (dates) VALUES (?)", (",".join(saved_dates + [dt_str]),))
+                conn.cursor().execute("INSERT INTO events (dates) VALUES (?)", (",".join(new_list),))
+            st.success(f"追加: {dt_str}")
             st.rerun()
-        if st.button("全リセット"):
+        
+        if st.button("全リセット", type="primary"):
             if os.path.exists(DB_FILE): os.remove(DB_FILE)
             st.rerun()
-        st.dataframe(resp_table)
+            
+        st.divider()
+        st.subheader("📊 回答状況")
+        st.dataframe(resp_table, use_container_width=True)
 
     with t2:
-        st.subheader("会場検索")
-        area = st.text_input("検索エリア", value="所沢")
-        
-        if st.button("会場を検索する"):
-            if not API_KEY:
-                st.error("❌ APIキーが設定されていません。StreamlitのSecretsを確認してください。")
-            else:
-                url = "http://webservice.recruit.co.jp/hotpepper/gourmet/v1/"
-                # 検索条件を少し緩めてヒットしやすくします
-                params = {
-                    "key": API_KEY,
-                    "keyword": area, 
-                    "count": 5,
-                    "format": "json"
-                }
-                
-                try:
-                    res = requests.get(url, params=params)
-                    data = res.json()
-                    
-                    # デバッグ情報の表示（エラー時のみ役立つ）
-                    if "error" in data.get("results", {}):
-                        st.error(f"APIエラーが発生しました: {data['results']['error'][0]['message']}")
-                    
-                    st.session_state.shops = data.get('results', {}).get('shop', [])
-                    
-                    if not st.session_state.shops:
-                        st.warning(f"「{area}」で見つかりませんでした。キーワードを変えてみてください。")
-                
-                except Exception as e:
-                    st.error(f"通信エラーが発生しました: {e}")
-
-        if "shops" in st.session_state:
-            for s in st.session_state.shops:
-                with st.container(border=True):
-                    col_img, col_txt = st.columns([1, 2])
-                    with col_img: st.image(s['photo']['pc']['l'])
-                    with col_txt:
-                        st.subheader(s['name'])
-                        st.write(f"💰 {s['budget']['name']} / 📍 {s['mobile_access']}")
-                        st.write(f"🔗 [詳細]({s['urls']['pc']})")
-                        if st.button(f"{s['name']}に決定", key=s['id']):
-                            st.session_state.final_msg = f"【懇親会のお知らせ】\n日時：未定\n場所：{s['name']}\n地図：{s['urls']['pc']}"
+        if not saved_dates:
+            st.warning("先に日程を設定してください")
+        else:
+            st.subheader("2. 開催日と会場の決定")
+            c_a, c_b = st.columns(2)
+            # 決定した日程を選択（ここで選んだものが案内文に入ります）
+            selected_date = c_a.selectbox("最終決定日を選択", saved_dates)
+            area = c_b.text_input("検索エリア", value="所沢")
             
-        if "final_msg" in st.session_state:
-            st.text_area("案内文", value=st.session_state.final_msg, height=150)
+            if st.button("会場を検索する", use_container_width=True):
+                url = "http://webservice.recruit.co.jp/hotpepper/gourmet/v1/"
+                params = {"key": API_KEY, "keyword": area, "count": 5, "format": "json"}
+                res = requests.get(url, params=params)
+                st.session_state.shops = res.json().get('results', {}).get('shop', [])
 
+            if "shops" in st.session_state:
+                for s in st.session_state.shops:
+                    with st.container(border=True):
+                        col_img, col_txt = st.columns([1, 2])
+                        with col_img: st.image(s['photo']['pc']['l'])
+                        with col_txt:
+                            st.subheader(s['name'])
+                            st.write(f"💰 予算: {s['budget']['name']} / 📍 {s['mobile_access']}")
+                            st.write(f"🔗 [詳細を表示]({s['urls']['pc']})")
+                            
+                            # このボタンを押すと、上の selected_date と組み合わせて案内文を作る
+                            if st.button(f"このお店（{s['name']}）で決定！", key=s['id']):
+                                st.session_state.final_msg = f"""【懇親会開催のお知らせ】
+
+皆様お疲れ様です。
+日程調整へのご協力ありがとうございました。
+検討の結果、以下の内容で決定いたしました！
+
+■日時：{selected_date}
+■場所：{s['name']}
+■住所：{s['address']}
+■地図：{s['urls']['pc']}
+■予算：{s['budget']['name']}
+
+当日のご参加をお待ちしております！"""
+                                st.success(f"「{s['name']}」に決定しました。下に案内文が表示されます。")
+                                st.rerun()
+
+            if "final_msg" in st.session_state:
+                st.divider()
+                st.subheader("📝 そのまま送れる案内文")
+                st.text_area("コピーしてSlackやTeamsに貼り付け", value=st.session_state.final_msg, height=280)
+
+# --- 参加者画面 ---
 else:
-    st.title("🤝 懇親会アンケート")
+    st.title("🤝 懇親会 日程アンケート")
     sd, _ = load_data()
-    if not sd: st.info("準備中")
+    if not sd:
+        st.info("幹事が日程を調整中です。公開までお待ちください。")
     else:
-        with st.form("f"):
-            n = st.text_input("名前")
-            ans = {d: st.radio(d, ["○","△","×"], horizontal=True) for d in sd}
-            if st.form_submit_button("送信") and n:
-                with sqlite3.connect(DB_FILE) as conn:
-                    conn.cursor().execute("INSERT INTO responses (name, answers) VALUES (?, ?)", (n, json.dumps(ans)))
-                st.success("保存完了")
+        with st.form("user_form"):
+            n = st.text_input("お名前（フルネーム）")
+            ans = {d: st.radio(d, ["○ (参加)", "△ (未定)", "× (不可)"], horizontal=True) for d in sd}
+            if st.form_submit_button("回答を送信"):
+                if n:
+                    with sqlite3.connect(DB_FILE) as conn:
+                        conn.cursor().execute("INSERT INTO responses (name, answers) VALUES (?, ?)", (n, json.dumps(ans, ensure_ascii=False)))
+                    st.success("回答を送信しました。ご協力ありがとうございます！")
+                else:
+                    st.error("お名前を入力してください")
