@@ -13,7 +13,7 @@ ADMIN_USER = "admin"
 ADMIN_PASS = "noukai2026"
 DB_FILE = "konshinkai_data.db"
 
-# --- DB操作 ---
+# --- DB操作関数 ---
 def init_db():
     with sqlite3.connect(DB_FILE) as conn:
         c = conn.cursor()
@@ -26,18 +26,27 @@ def load_data():
     with sqlite3.connect(DB_FILE) as conn:
         event_df = pd.read_sql("SELECT * FROM events", conn)
         resp_df = pd.read_sql("SELECT * FROM responses", conn)
+    
     dates = event_df["dates"].iloc[0].split(",") if not event_df.empty else []
     rows = []
     for _, row in resp_df.iterrows():
-        ans = json.loads(row["answers"])
-        ans["名前"] = row["name"]
-        rows.append(ans)
+        try:
+            ans = json.loads(row["answers"])
+            ans["名前"] = row["name"]
+            rows.append(ans)
+        except: continue
+    
+    # 読み込んだデータを表形式に整える
     df = pd.DataFrame(rows) if rows else pd.DataFrame(columns=["名前"] + dates)
+    # カラムの順番を「名前」を先頭に固定
+    if not df.empty and "名前" in df.columns:
+        cols = ["名前"] + [c for c in df.columns if c != "名前"]
+        df = df[cols]
     return dates, df
 
 init_db()
 
-# --- サイドバー ---
+# --- メインロジック ---
 mode = st.sidebar.radio("モード切替", ["参加者画面", "管理者画面"])
 
 if mode == "管理者画面":
@@ -65,7 +74,6 @@ if mode == "管理者画面":
             with sqlite3.connect(DB_FILE) as conn:
                 conn.cursor().execute("DELETE FROM events")
                 conn.cursor().execute("INSERT INTO events (dates) VALUES (?)", (",".join(new_list),))
-            st.success(f"追加: {dt_str}")
             st.rerun()
         
         if st.button("全リセット", type="primary"):
@@ -73,16 +81,14 @@ if mode == "管理者画面":
             st.rerun()
             
         st.divider()
-        st.subheader("📊 回答状況")
+        st.subheader("📊 回答状況（管理者用詳細）")
         st.dataframe(resp_table, use_container_width=True)
 
     with t2:
-        if not saved_dates:
-            st.warning("先に日程を設定してください")
+        if not saved_dates: st.warning("先に日程を設定してください")
         else:
             st.subheader("2. 開催日と会場の決定")
             c_a, c_b = st.columns(2)
-            # 決定した日程を選択（ここで選んだものが案内文に入ります）
             selected_date = c_a.selectbox("最終決定日を選択", saved_dates)
             area = c_b.text_input("検索エリア", value="所沢")
             
@@ -100,45 +106,43 @@ if mode == "管理者画面":
                         with col_txt:
                             st.subheader(s['name'])
                             st.write(f"💰 予算: {s['budget']['name']} / 📍 {s['mobile_access']}")
-                            st.write(f"🔗 [詳細を表示]({s['urls']['pc']})")
-                            
-                            # このボタンを押すと、上の selected_date と組み合わせて案内文を作る
-                            if st.button(f"このお店（{s['name']}）で決定！", key=s['id']):
-                                st.session_state.final_msg = f"""【懇親会開催のお知らせ】
-
-皆様お疲れ様です。
-日程調整へのご協力ありがとうございました。
-検討の結果、以下の内容で決定いたしました！
-
-■日時：{selected_date}
-■場所：{s['name']}
-■住所：{s['address']}
-■地図：{s['urls']['pc']}
-■予算：{s['budget']['name']}
-
-当日のご参加をお待ちしております！"""
-                                st.success(f"「{s['name']}」に決定しました。下に案内文が表示されます。")
+                            if st.button(f"{s['name']}で決定！", key=s['id']):
+                                st.session_state.final_msg = f"【懇親会のお知らせ】\n\n■日時：{selected_date}\n■場所：{s['name']}\n■地図：{s['urls']['pc']}\n\nご参加お待ちしております！"
                                 st.rerun()
 
             if "final_msg" in st.session_state:
                 st.divider()
-                st.subheader("📝 そのまま送れる案内文")
-                st.text_area("コピーしてSlackやTeamsに貼り付け", value=st.session_state.final_msg, height=280)
+                st.text_area("送信用案内文", value=st.session_state.final_msg, height=200)
 
 # --- 参加者画面 ---
 else:
     st.title("🤝 懇親会 日程アンケート")
-    sd, _ = load_data()
+    sd, resp_table = load_data()
+    
     if not sd:
         st.info("幹事が日程を調整中です。公開までお待ちください。")
     else:
-        with st.form("user_form"):
-            n = st.text_input("お名前（フルネーム）")
-            ans = {d: st.radio(d, ["○ (参加)", "△ (未定)", "× (不可)"], horizontal=True) for d in sd}
-            if st.form_submit_button("回答を送信"):
-                if n:
-                    with sqlite3.connect(DB_FILE) as conn:
-                        conn.cursor().execute("INSERT INTO responses (name, answers) VALUES (?, ?)", (n, json.dumps(ans, ensure_ascii=False)))
-                    st.success("回答を送信しました。ご協力ありがとうございます！")
-                else:
-                    st.error("お名前を入力してください")
+        # 回答フォーム
+        with st.expander("📝 あなたの予定を回答する", expanded=True):
+            with st.form("user_form"):
+                n = st.text_input("お名前（フルネーム）")
+                ans = {d: st.radio(d, ["○", "△", "×"], horizontal=True) for d in sd}
+                if st.form_submit_button("回答を送信"):
+                    if n:
+                        with sqlite3.connect(DB_FILE) as conn:
+                            conn.cursor().execute("INSERT INTO responses (name, answers) VALUES (?, ?)", (n, json.dumps(ans, ensure_ascii=False)))
+                        st.success("回答を送信しました。ページを更新すると一覧に反映されます。")
+                        st.rerun()
+                    else: st.error("名前を入力してください")
+
+        # 回答状況の表示（追加部分）
+        st.divider()
+        st.subheader("📊 現在の回答状況")
+        if resp_table.empty or len(resp_table.columns) <= 1:
+            st.write("まだ回答はありません。一番乗りで回答しましょう！")
+        else:
+            # 参加者が見やすいように表を表示
+            st.dataframe(resp_table, use_container_width=True, hide_index=True)
+            
+            # 簡易的な集計（○の数などを出すとより親切）
+            st.caption("※回答を変更したい場合は、同じ名前で再度送信するか幹事まで連絡してください。")
