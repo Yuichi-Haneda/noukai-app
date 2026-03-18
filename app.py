@@ -1,122 +1,147 @@
 import streamlit as st
 import pandas as pd
 import requests
+import sqlite3
 from datetime import datetime
+import os
 
 # --- 設定 ---
-st.set_page_config(page_title="納会調整くん Pro", layout="wide")
+st.set_page_config(page_title="納会調整くん Pro DB版", layout="wide")
 API_KEY = st.secrets.get("HOTPEPPER_API_KEY", "")
-
-# 管理者ログイン情報
 ADMIN_USER = "admin"
 ADMIN_PASS = "noukai2026"
 
-# --- データの保持 (session_state) ---
-if 'events' not in st.session_state:
-    st.session_state.events = {
-        "dates": [],
-        "responses": pd.DataFrame(columns=["名前"]),
-        "fixed_date": None,
-        "selected_shop": None
-    }
+# --- データベース準備 ---
+DB_FILE = "noukai_data.db"
 
-# --- 関数: お店検索 ---
-def search_shops(keyword):
-    url = "http://webservice.recruit.co.jp/hotpepper/gourmet/v1/"
-    params = {"key": API_KEY, "keyword": f"{keyword} 宴会", "count": 3, "format": "json", "order": 4}
-    res = requests.get(url, params=params)
-    return res.json().get('results', {}).get('shop', []) if res.status_code == 200 else []
+def init_db():
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    # イベント情報テーブル
+    c.execute('''CREATE TABLE IF NOT EXISTS events 
+                 (id INTEGER PRIMARY KEY, dates TEXT, fixed_date TEXT, shop_json TEXT)''')
+    # 参加者回答テーブル
+    c.execute('''CREATE TABLE IF NOT EXISTS responses 
+                 (id INTEGER PRIMARY KEY, name TEXT, answers TEXT)''')
+    conn.commit()
+    conn.close()
 
-# --- サイドバー ---
+def save_event_config(dates):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("DELETE FROM events") # 常に1つのイベントとして上書き
+    c.execute("INSERT INTO events (dates) VALUES (?)", (",".join(dates),))
+    c.execute("DELETE FROM responses") # 日程が変わったら回答もリセット
+    conn.commit()
+    conn.close()
+
+def save_response(name, answers_dict):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    import json
+    c.execute("INSERT INTO responses (name, answers) VALUES (?, ?)", (name, json.dumps(answers_dict)))
+    conn.commit()
+    conn.close()
+
+def load_data():
+    conn = sqlite3.connect(DB_FILE)
+    # イベント読み込み
+    event_df = pd.read_sql("SELECT * FROM events", conn)
+    # 回答読み込み
+    resp_df = pd.read_sql("SELECT * FROM responses", conn)
+    conn.close()
+    
+    dates = event_df["dates"].iloc[0].split(",") if not event_df.empty else []
+    
+    # 回答表を整形
+    import json
+    rows = []
+    for _, row in resp_df.iterrows():
+        ans = json.loads(row["answers"])
+        ans["名前"] = row["name"]
+        rows.append(ans)
+    
+    df = pd.DataFrame(rows) if rows else pd.DataFrame(columns=["名前"] + dates)
+    return dates, df
+
+# 起動時にDB初期化
+init_db()
+
+# --- アプリ本体 ---
 mode = st.sidebar.radio("表示切替", ["参加者画面", "管理者画面"])
 
 if mode == "管理者画面":
-    st.title("🔐 管理者専用パネル")
-    
+    st.title("🔐 管理者パネル (DB保存版)")
     if 'logged_in' not in st.session_state: st.session_state.logged_in = False
     if not st.session_state.logged_in:
-        with st.form("login_form"):
-            user = st.text_input("ID")
-            pw = st.text_input("Password", type="password")
-            if st.form_submit_button("ログイン"):
-                if user == ADMIN_USER and pw == ADMIN_PASS:
-                    st.session_state.logged_in = True
-                    st.rerun()
-                else: st.error("認証失敗")
+        with st.form("login"):
+            u, p = st.text_input("ID"), st.text_input("PASS", type="password")
+            if st.form_submit_button("ログイン") and u == ADMIN_USER and p == ADMIN_PASS:
+                st.session_state.logged_in = True
+                st.rerun()
         st.stop()
+
+    # DBから最新情報をロード
+    saved_dates, resp_table = load_data()
 
     tab1, tab2 = st.tabs(["日程設定・回答確認", "お店選び・案内作成"])
 
     with tab1:
-        st.subheader("1. 候補日時の設定")
-        col1, col2 = st.columns(2)
-        with col1: d = st.date_input("候補日を追加")
-        with col2: t = st.time_input("開始時間", value=datetime.strptime("18:30", "%H:%M").time())
+        st.subheader("1. 候補日時の追加")
+        c1, c2 = st.columns(2)
+        d = c1.date_input("日付")
+        t = c2.time_input("時間", value=datetime.strptime("18:30", "%H:%M").time())
         
-        if st.button("この日時をリストに追加"):
-            datetime_str = f"{d.strftime('%m/%d')}({['月','火','水','木','金','土','日'][d.weekday()]}) {t.strftime('%H:%M')}～"
-            if datetime_str not in st.session_state.events["dates"]:
-                st.session_state.events["dates"].append(datetime_str)
-                st.session_state.events["responses"] = pd.DataFrame(columns=["名前"] + st.session_state.events["dates"])
-                st.success(f"追加: {datetime_str}")
+        if st.button("この日時をDBに保存"):
+            dt_str = f"{d.strftime('%m/%d')}({['月','火','水','木','金','土','日'][d.weekday()]}) {t.strftime('%H:%M')}～"
+            new_dates = saved_dates + [dt_str] if dt_str not in saved_dates else saved_dates
+            save_event_config(new_dates)
+            st.success("データベースに保存しました")
+            st.rerun()
 
-        if st.button("リストをリセット"):
-            st.session_state.events["dates"] = []; st.session_state.events["responses"] = pd.DataFrame(columns=["名前"])
-            st.session_state.events["fixed_date"] = None; st.session_state.events["selected_shop"] = None
+        if st.button("全データをリセット", type="primary"):
+            conn = sqlite3.connect(DB_FILE)
+            conn.cursor().execute("DROP TABLE IF EXISTS events")
+            conn.cursor().execute("DROP TABLE IF EXISTS responses")
+            conn.commit()
+            conn.close()
             st.rerun()
 
         st.divider()
-        st.subheader("📊 回答状況")
-        st.dataframe(st.session_state.events["responses"], use_container_width=True)
+        st.subheader("📊 現在の回答状況 (リアルタイムDB参照)")
+        st.dataframe(resp_table, use_container_width=True)
 
     with tab2:
-        if not st.session_state.events["dates"]:
-            st.warning("先に日程を設定してください")
+        # (お店検索・案内文ロジックは前回同様)
+        if not saved_dates: st.warning("日程を先に設定してください")
         else:
-            st.subheader("2. 開催日とお見せの決定")
-            # 決定済みの情報を保持するためのセレクトボックス
-            st.session_state.events["fixed_date"] = st.selectbox("最終決定日を選択", st.session_state.events["dates"])
-            
+            selected_date = st.selectbox("決定日", saved_dates)
             area = st.text_input("検索エリア", value="所沢")
-            if st.button("おすすめのお店を検索"):
-                st.session_state.shop_results = search_shops(area)
+            if st.button("お店検索"):
+                url = "http://webservice.recruit.co.jp/hotpepper/gourmet/v1/"
+                res = requests.get(url, params={"key":API_KEY, "keyword":f"{area} 宴会", "count":3, "format":"json", "order":4})
+                st.session_state.shops = res.json().get('results', {}).get('shop', [])
 
-            # 検索結果の表示
-            if "shop_results" in st.session_state:
-                for shop in st.session_state.shop_results:
+            if "shops" in st.session_state:
+                for s in st.session_state.shops:
                     with st.container(border=True):
-                        c1, c2 = st.columns([1, 2])
-                        with c1: st.image(shop['photo']['pc']['l'])
-                        with c2:
-                            st.subheader(shop['name'])
-                            st.write(f"🔗 [ホットペッパーで見る]({shop['urls']['pc']})")
-                            # ボタンを押した時にshop情報を保存して再描画
-                            if st.button(f"この店に決定", key=f"btn_{shop['id']}"):
-                                st.session_state.events["selected_shop"] = shop
-                                st.success(f"{shop['name']} に決定しました！")
-                                st.rerun() # ここで再描画して案内文を表示させる
+                        st.subheader(s['name'])
+                        st.write(f"🔗 [詳細を表示]({s['urls']['pc']})")
+                        if st.button(f"{s['name']}に決定", key=s['id']):
+                            st.session_state.final_msg = f"【納会のお知らせ】\n日時：{selected_date}\n場所：{s['name']}\nURL：{s['urls']['pc']}"
+            
+            if "final_msg" in st.session_state:
+                st.text_area("案内文", value=st.session_state.final_msg, height=150)
 
-            # --- 案内文エリア（ここを独立させました） ---
-            if st.session_state.events["selected_shop"]:
-                st.divider()
-                st.subheader("📝 送信用メッセージ")
-                s = st.session_state.events["selected_shop"]
-                d = st.session_state.events["fixed_date"]
-                msg = f"【納会開催のお知らせ】\n日時の調整が完了しました！\n\n■日時：{d}\n■場所：{s['name']}\n■地図：{s['urls']['pc']}\n■予算：{s['budget']['name']}\n\n皆様のご参加をお待ちしております！"
-                st.text_area("コピーして共有", value=msg, height=200)
-
-# --- 参加者画面 ---
 else:
     st.title("🗓 納会日程アンケート")
-    if not st.session_state.events["dates"]:
-        st.info("幹事が日程を調整中です。")
+    saved_dates, _ = load_data()
+    if not saved_dates:
+        st.info("現在調整中です。")
     else:
         with st.form("user_form"):
-            name = st.text_input("お名前（必須）")
-            ans_list = {d: st.radio(d, ["○", "△", "×"], horizontal=True) for d in st.session_state.events["dates"]}
-            if st.form_submit_button("回答を送信"):
-                if name:
-                    new_data = {"名前": name}; new_data.update(ans_list)
-                    st.session_state.events["responses"] = pd.concat([st.session_state.events["responses"], pd.DataFrame([new_data])], ignore_index=True)
-                    st.success("回答を受け付けました！")
-                else: st.error("名前を入れてください")
+            name = st.text_input("お名前")
+            ans = {d: st.radio(d, ["○", "△", "×"], horizontal=True) for d in saved_dates}
+            if st.form_submit_button("回答を送信") and name:
+                save_response(name, ans)
+                st.success("回答をデータベースに記録しました！")
