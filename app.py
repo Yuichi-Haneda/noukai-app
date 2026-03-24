@@ -4,145 +4,189 @@ import requests
 import sqlite3
 import json
 import os
+import urllib.parse
 from datetime import datetime
 
-# --- 基本設定 ---
-st.set_page_config(page_title="懇親会調整くん", page_icon="🤝", layout="wide")
+# --- 設定 ---
+st.set_page_config(page_title="懇親会調整 Pro Max+", page_icon="🤝", layout="wide")
 API_KEY = st.secrets.get("HOTPEPPER_API_KEY", "")
-ADMIN_USER = "admin"
-ADMIN_PASS = "noukai2026"
-DB_FILE = "konshinkai_data.db"
+DB_FILE = "multi_event_food_data.db"
 
-# --- DB操作関数 ---
+# 予算コード変換表
+BUDGET_MAP = {"指定なし": "", "2001〜3000円": "B002", "3001〜4000円": "B003", "4001〜5000円": "B008", "5001〜7000円": "B004"}
+
+# --- DB初期化 ---
 def init_db():
     with sqlite3.connect(DB_FILE) as conn:
         c = conn.cursor()
-        c.execute('CREATE TABLE IF NOT EXISTS events (id INTEGER PRIMARY KEY, dates TEXT)')
-        c.execute('CREATE TABLE IF NOT EXISTS responses (id INTEGER PRIMARY KEY, name TEXT, answers TEXT)')
+        # responsesテーブルに dislikes カラムを追加
+        c.execute('CREATE TABLE IF NOT EXISTS events (id INTEGER PRIMARY KEY, title TEXT, password TEXT)')
+        c.execute('CREATE TABLE IF NOT EXISTS dates (id INTEGER PRIMARY KEY, event_id INTEGER, dt_text TEXT)')
+        c.execute('CREATE TABLE IF NOT EXISTS responses (id INTEGER PRIMARY KEY, event_id INTEGER, name TEXT, ans TEXT, dislikes TEXT)')
         conn.commit()
-
-def load_data():
-    if not os.path.exists(DB_FILE): return [], pd.DataFrame(columns=["名前"])
-    with sqlite3.connect(DB_FILE) as conn:
-        event_df = pd.read_sql("SELECT * FROM events", conn)
-        resp_df = pd.read_sql("SELECT * FROM responses", conn)
-    
-    dates = event_df["dates"].iloc[0].split(",") if not event_df.empty else []
-    rows = []
-    for _, row in resp_df.iterrows():
-        try:
-            ans = json.loads(row["answers"])
-            ans["名前"] = row["name"]
-            rows.append(ans)
-        except: continue
-    
-    # 読み込んだデータを表形式に整える
-    df = pd.DataFrame(rows) if rows else pd.DataFrame(columns=["名前"] + dates)
-    # カラムの順番を「名前」を先頭に固定
-    if not df.empty and "名前" in df.columns:
-        cols = ["名前"] + [c for c in df.columns if c != "名前"]
-        df = df[cols]
-    return dates, df
 
 init_db()
 
-# --- メインロジック ---
+# --- データ取得関数 ---
+def get_events():
+    with sqlite3.connect(DB_FILE) as conn:
+        return pd.read_sql("SELECT * FROM events", conn)
+
+def get_responses(ev_id):
+    with sqlite3.connect(DB_FILE) as conn:
+        resps = pd.read_sql(f"SELECT name, ans, dislikes FROM responses WHERE event_id={ev_id}", conn)
+    if resps.empty: return pd.DataFrame()
+    rows = []
+    for _, r in resps.iterrows():
+        d_row = json.loads(r["ans"])
+        d_row["名前"] = r["name"]
+        d_row["苦手・アレルギー"] = r["dislikes"]
+        rows.append(d_row)
+    df = pd.DataFrame(rows)
+    cols = ["名前", "苦手・アレルギー"] + [c for c in df.columns if c not in ["名前", "苦手・アレルギー"]]
+    return df[cols]
+
+# --- メインUI ---
+st.sidebar.title("🤝 懇親会調整ツール")
 mode = st.sidebar.radio("モード切替", ["参加者画面", "管理者画面"])
 
 if mode == "管理者画面":
     st.title("⚙️ 管理者パネル")
-    if 'logged_in' not in st.session_state: st.session_state.logged_in = False
-    if not st.session_state.logged_in:
-        with st.form("login"):
-            u, p = st.text_input("ID"), st.text_input("PASS", type="password")
-            if st.form_submit_button("ログイン") and u == ADMIN_USER and p == ADMIN_PASS:
-                st.session_state.logged_in = True
+    
+    # イベント作成
+    with st.expander("➕ 新しいイベントを作成する"):
+        with st.form("create_ev"):
+            new_title = st.text_input("イベント名")
+            new_pass = st.text_input("管理パスワード", type="password")
+            if st.form_submit_button("作成"):
+                if new_title and new_pass:
+                    with sqlite3.connect(DB_FILE) as conn:
+                        conn.cursor().execute("INSERT INTO events (title, password) VALUES (?, ?)", (new_title, new_pass))
+                    st.success("作成しました！")
+                    st.rerun()
+
+    event_list = get_events()
+    if event_list.empty: st.stop()
+
+    sel_title = st.selectbox("管理するイベントを選択", event_list["title"])
+    target_ev = event_list[event_list["title"] == sel_title].iloc[0]
+    ev_id = target_ev["id"]
+    
+    # 認証
+    auth_key = f"auth_{ev_id}"
+    if auth_key not in st.session_state: st.session_state[auth_key] = False
+    if not st.session_state[auth_key]:
+        if st.text_input("パスワード", type="password") == target_ev["password"]:
+            if st.button("ログイン"):
+                st.session_state[auth_key] = True
                 st.rerun()
         st.stop()
 
-    saved_dates, resp_table = load_data()
-    t1, t2 = st.tabs(["🗓 日程設定・回答確認", "🍺 会場選び・案内作成"])
+    t1, t2, t3 = st.tabs(["🗓 日程管理", "📊 回答・苦手確認", "🍺 会場検索"])
 
     with t1:
-        st.subheader("1. 候補日時の追加")
-        col1, col2 = st.columns(2)
-        d = col1.date_input("日付")
-        t = col2.time_input("時間", value=datetime.strptime("18:30", "%H:%M").time())
-        if st.button("この日時をリストに追加"):
-            dt_str = f"{d.strftime('%m/%d')}({['月','火','水','木','金','土','日'][d.weekday()]}) {t.strftime('%H:%M')}～"
-            new_list = saved_dates + [dt_str] if dt_str not in saved_dates else saved_dates
+        st.subheader("候補日の追加")
+        d = st.date_input("日付")
+        if st.button("日程を追加"):
+            dt_str = d.strftime('%m/%d')
             with sqlite3.connect(DB_FILE) as conn:
-                conn.cursor().execute("DELETE FROM events")
-                conn.cursor().execute("INSERT INTO events (dates) VALUES (?)", (",".join(new_list),))
+                conn.cursor().execute("INSERT INTO dates (event_id, dt_text) VALUES (?, ?)", (int(ev_id), dt_str))
             st.rerun()
-        
-        if st.button("全リセット", type="primary"):
-            if os.path.exists(DB_FILE): os.remove(DB_FILE)
-            st.rerun()
-            
-        st.divider()
-        st.subheader("📊 回答状況（管理者用詳細）")
-        st.dataframe(resp_table, use_container_width=True)
 
     with t2:
-        if not saved_dates: st.warning("先に日程を設定してください")
-        else:
-            st.subheader("2. 開催日と会場の決定")
-            c_a, c_b = st.columns(2)
-            selected_date = c_a.selectbox("最終決定日を選択", saved_dates)
-            area = c_b.text_input("検索エリア", value="所沢")
-            
-            if st.button("会場を検索する", use_container_width=True):
-                url = "http://webservice.recruit.co.jp/hotpepper/gourmet/v1/"
-                params = {"key": API_KEY, "keyword": area, "count": 5, "format": "json"}
-                res = requests.get(url, params=params)
-                st.session_state.shops = res.json().get('results', {}).get('shop', [])
+        df_resp = get_responses(ev_id)
+        if not df_resp.empty:
+            st.dataframe(df_resp, use_container_width=True)
+            # 苦手なものをリスト化
+            dislike_list = [x for x in df_resp["苦手・アレルギー"].tolist() if x]
+            if dislike_list:
+                st.warning(f"⚠️ 参加者の苦手なもの: {', '.join(dislike_list)}")
+                st.session_state.current_dislikes = dislike_list
+        else: st.write("回答待ちです。")
 
-            if "shops" in st.session_state:
-                for s in st.session_state.shops:
+    with t3:
+        st.subheader("お店の検索（苦手フィルタ適用）")
+        with sqlite3.connect(DB_FILE) as conn:
+            saved_dates = pd.read_sql(f"SELECT dt_text FROM dates WHERE event_id={ev_id}", conn)["dt_text"].tolist()
+        
+        if not saved_dates: st.warning("日程を先に設定してください")
+        else:
+            c1, c2, c3 = st.columns([2, 1, 1])
+            sel_date = c1.selectbox("開催日", saved_dates)
+            area = c2.text_input("検索エリア", "所沢")
+            budget = c3.selectbox("予算", list(BUDGET_MAP.keys()))
+            
+            # フィルタリング設定
+            use_filter = st.checkbox("参加者の苦手なものを含む店を除外する", value=True)
+            
+            if st.button("お店を検索する", use_container_width=True):
+                params = {"key": API_KEY, "keyword": area, "budget": BUDGET_MAP[budget], "count": 20, "format": "json"}
+                res = requests.get("http://webservice.recruit.co.jp/hotpepper/gourmet/v1/", params=params)
+                shops = res.json().get('results', {}).get('shop', [])
+                
+                # --- フィルタリングロジック ---
+                filtered_shops = []
+                dislikes = st.session_state.get('current_dislikes', [])
+                
+                for s in shops:
+                    # 店名、キャッチコピー、料理ジャンルの中に苦手ワードがあるかチェック
+                    shop_info_text = (s['name'] + s['catch'] + s['genre']['name'] + s['sub_genre']['name']).lower()
+                    is_bad = False
+                    if use_filter:
+                        for word in dislikes:
+                            if word.lower() in shop_info_text:
+                                is_bad = True
+                                break
+                    if not is_bad:
+                        filtered_shops.append(s)
+                
+                st.session_state.shop_results = filtered_shops[:5] # 上位5件表示
+                st.success(f"{len(shops)}件中、条件に合う{len(filtered_shops)}件を表示しています。")
+
+            if "shop_results" in st.session_state:
+                for s in st.session_state.shop_results:
+                    gmap_url = f"https://www.google.com/maps/search/?api=1&query={urllib.parse.quote(s['name'] + ' ' + s['address'])}"
                     with st.container(border=True):
-                        col_img, col_txt = st.columns([1, 2])
-                        with col_img: st.image(s['photo']['pc']['l'])
-                        with col_txt:
+                        c1, c2 = st.columns([1, 2])
+                        with c1: st.image(s['photo']['pc']['l'])
+                        with c2:
                             st.subheader(s['name'])
-                            st.write(f"💰 予算: {s['budget']['name']} / 📍 {s['mobile_access']}")
-                            if st.button(f"{s['name']}で決定！", key=s['id']):
-                                st.session_state.final_msg = f"【懇親会のお知らせ】\n\n■日時：{selected_date}\n■場所：{s['name']}\n■地図：{s['urls']['pc']}\n\nご参加お待ちしております！"
+                            st.write(f"🍴 ジャンル: {s['genre']['name']} / 💰 {s['budget']['name']}")
+                            st.write(f"🗺️ [Googleマップで開く]({gmap_url})")
+                            if st.button(f"「{s['name']}」に決定！", key=f"btn_{s['id']}"):
+                                st.session_state.final_msg = f"【懇親会のお知らせ】\n\n日時：{sel_date}\n場所：{s['name']}\n住所：{s['address']}\n地図：{gmap_url}\n予算：{s['budget']['name']}"
                                 st.rerun()
 
             if "final_msg" in st.session_state:
-                st.divider()
-                st.text_area("送信用案内文", value=st.session_state.final_msg, height=200)
+                st.text_area("案内文", value=st.session_state.final_msg, height=200)
 
 # --- 参加者画面 ---
 else:
-    st.title("🤝 懇親会 日程アンケート")
-    sd, resp_table = load_data()
-    
-    if not sd:
-        st.info("幹事が日程を調整中です。公開までお待ちください。")
+    st.title("🤝 懇親会アンケート")
+    event_list = get_events()
+    if event_list.empty: st.info("準備中")
     else:
-        # 回答フォーム
-        with st.expander("📝 あなたの予定を回答する", expanded=True):
-            with st.form("user_form"):
-                n = st.text_input("お名前（フルネーム）")
-                ans = {d: st.radio(d, ["○", "△", "×"], horizontal=True) for d in sd}
+        sel_ev = st.selectbox("イベントを選択", event_list["title"])
+        ev_id = event_list[event_list["title"] == sel_ev]["id"].values[0]
+        with sqlite3.connect(DB_FILE) as conn:
+            d_list = pd.read_sql(f"SELECT dt_text FROM dates WHERE event_id={ev_id}", conn)["dt_text"].tolist()
+
+        if d_list:
+            with st.form("ans_form"):
+                n = st.text_input("お名前")
+                # 苦手なもの入力欄を追加
+                dislikes = st.text_input("苦手な食べ物・アレルギー（任意）", placeholder="例：パクチー、生魚、ナッツ類など")
+                st.divider()
+                ans = {d: st.radio(d, ["○", "△", "×"], horizontal=True) for d in d_list}
                 if st.form_submit_button("回答を送信"):
                     if n:
                         with sqlite3.connect(DB_FILE) as conn:
-                            conn.cursor().execute("INSERT INTO responses (name, answers) VALUES (?, ?)", (n, json.dumps(ans, ensure_ascii=False)))
-                        st.success("回答を送信しました。ページを更新すると一覧に反映されます。")
+                            conn.cursor().execute("INSERT INTO responses (event_id, name, ans, dislikes) VALUES (?, ?, ?, ?)", 
+                                                 (int(ev_id), n, json.dumps(ans, ensure_ascii=False), dislikes))
+                        st.success("回答を送信しました！")
                         st.rerun()
-                    else: st.error("名前を入力してください")
-
-        # 回答状況の表示（追加部分）
-        st.divider()
-        st.subheader("📊 現在の回答状況")
-        if resp_table.empty or len(resp_table.columns) <= 1:
-            st.write("まだ回答はありません。一番乗りで回答しましょう！")
-        else:
-            # 参加者が見やすいように表を表示
-            st.dataframe(resp_table, use_container_width=True, hide_index=True)
             
-            # 簡易的な集計（○の数などを出すとより親切）
-            st.caption("※回答を変更したい場合は、同じ名前で再度送信するか幹事まで連絡してください。")
+            st.divider()
+            st.subheader("📊 現在の回答状況")
+            df_resp = get_responses(ev_id)
+            if not df_resp.empty: st.dataframe(df_resp, use_container_width=True, hide_index=True)
